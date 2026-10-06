@@ -1,0 +1,14 @@
+# TEST. Переопределяет только то, что в тестовом окружении действительно
+# иначе; всё остальное берётся из values/default/values.yaml.
+
+name: "test-example-team-example-service"
+
+replicaCount: 1
+
+configmaps_envs:
+    ENVIRONMENT: "test"
+    LOG_LEVEL: "DEBUG"
+    # Страница съёмки с телефона. В TEST она включена: без неё сценарий не
+    # показать живьём, а камеру браузер отдаёт странице только по HTTPS, то
+    # есть через ingress. В PROD выключена.
+    SERVE_DEMO_PAGE: "true"

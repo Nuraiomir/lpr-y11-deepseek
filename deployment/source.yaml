@@ -1,0 +1,15 @@
+# Манифест приложения для AIDA.
+#
+# Имена здесь это заготовки шаблона (example-*). Заполнять их руками не нужно
+# и не стоит: `aida init` выводит команду, владельца и имя сервиса из пути
+# репозитория в GitLab и переписывает их сам, вместе с namespace_pattern. См.
+# раздел «Деплой» в README.
+#
+# Тега образа здесь нет нарочно: его подставляет CI ключом --image-tag.
+project:
+    name: example-project
+    owner: example-team
+    namespace_pattern: "{env}-example-team-example-project"
+application:
+    name: example-service
+    helm_chart_version: v0.18.0

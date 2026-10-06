@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>LPR Camera Demo</title>
+
+<style>
+    :root {
+        --bg: #f4f4f5;
+        --card: #ffffff;
+        --ink: #18181b;
+        --muted: #71717a;
+        --line: #d4d4d8;
+        --ok: #15803d;
+        --warn: #b45309;
+        --err: #b00020;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 20px 16px 48px;
+        background: var(--bg);
+        color: var(--ink);
+    }
+
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    .sub { margin: 0 0 20px; color: var(--muted); font-size: 14px; }
+
+    .card {
+        background: var(--card);
+        padding: 18px;
+        border-radius: 12px;
+        margin-bottom: 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,.08);
+    }
+
+    label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
+    .field { margin-bottom: 14px; }
+
+    input[type="text"], input[type="password"] {
+        width: 100%;
+        padding: 11px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-size: 16px;            /* 16px keeps iOS from zooming on focus */
+        background: #fff;
+        color: var(--ink);
+    }
+
+    .remember { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+    .remember input { width: auto; }
+
+    button {
+        padding: 13px 20px;
+        border: none;
+        border-radius: 8px;
+        background: var(--ink);
+        color: #fff;
+        font-size: 16px;
+        cursor: pointer;
+    }
+    button.stop { background: #52525b; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+
+    /* Video and the box drawn over it share one stacking box so the
+       overlay lines up with the picture at any screen width. */
+    .viewport {
+        position: relative;
+        margin-top: 4px;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #000;
+        display: none;
+    }
+    .viewport.on { display: block; }
+
+    video { width: 100%; display: block; }
+    #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+    .readout {
+        position: absolute;
+        left: 0; right: 0; bottom: 0;
+        padding: 14px 16px 16px;
+        background: linear-gradient(transparent, rgba(0,0,0,.78));
+        color: #fff;
+        text-align: center;
+    }
+    .readout .label { font-size: 12px; letter-spacing: .12em; opacity: .75; }
+    .readout .plate {
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: .09em;
+        line-height: 1.25;
+        font-variant-numeric: tabular-nums;
+        min-height: 44px;
+    }
+    .readout .meta { font-size: 13px; opacity: .85; min-height: 18px; }
+    .readout.searching .plate { font-size: 20px; font-weight: 500; opacity: .8; letter-spacing: normal; }
+
+
+    /* ---- OCRM side of the scenario ---------------------------------- */
+    .ocrm { border-left: 4px solid var(--ink); }
+    .ocrm-head {
+        display: flex; align-items: flex-start; justify-content: space-between;
+        gap: 12px; margin-bottom: 4px;
+    }
+    .ocrm-label { font-size: 12px; letter-spacing: .1em; opacity: .6; text-transform: uppercase; }
+    .ocrm-plate {
+        font-size: 26px; font-weight: 700; letter-spacing: .07em;
+        font-variant-numeric: tabular-nums;
+    }
+    .ocrm-state {
+        font-size: 13px; padding: 4px 10px; border-radius: 999px;
+        background: #e4e4e7; white-space: nowrap;
+    }
+    .ocrm-state.found { background: #dcfce7; color: #14532d; }
+    .ocrm-state.missing { background: #fef3c7; color: #713f12; }
+
+    .rows { margin: 10px 0 14px; }
+    .rows section { padding: 10px 0; border-top: 1px solid #e4e4e7; }
+    .rows h4 {
+        margin: 0 0 6px; font-size: 12px; letter-spacing: .08em;
+        text-transform: uppercase; opacity: .55; font-weight: 600;
+    }
+    .rows dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 0; }
+    .rows dt { opacity: .6; }
+    .rows dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+    .rows dd.warn { color: #b45309; font-weight: 600; }
+
+    button.visit { width: 100%; background: #15803d; }
+    .visit-done {
+        margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+        background: #dcfce7; color: #14532d; font-size: 14px;
+    }
+
+    /* A plate that is not in the database is a normal outcome, so it is stated
+       plainly rather than dressed as an error. */
+    .missing-title { margin: 12px 0 6px; font-size: 17px; font-weight: 600; }
+    .missing-note { margin: 0; opacity: .7; font-size: 14px; }
+
+    .testdata {
+        margin: 14px 0 0; padding-top: 10px; border-top: 1px solid #e4e4e7;
+        font-size: 12px; opacity: .6;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        .ocrm-state { background: #3f3f46; }
+        .ocrm-state.found { background: #14532d; color: #dcfce7; }
+        .ocrm-state.missing { background: #713f12; color: #fef3c7; }
+        .rows section, .testdata { border-color: #3f3f46; }
+        .visit-done { background: #14532d; color: #dcfce7; }
+    }
+
+    .badge {
+        display: inline-block;
+        margin-top: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: var(--ok);
+        font-size: 12px;
+        font-weight: 600;
+        opacity: 0;
+        transition: opacity .25s;
+    }
+    .badge.on { opacity: 1; }
+
+    #status { margin-top: 14px; font-size: 14px; min-height: 20px; }
+    #status.err { color: var(--err); font-weight: 600; }
+    #status.warn { color: var(--warn); }
+
+    .stats {
+        margin-top: 12px;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+    }
+
+    .note { font-size: 13px; color: var(--muted); line-height: 1.5; }
+    .note code { background: #e4e4e7; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+
+<body>
+
+<h1>Сканирование ГРНЗ</h1>
+<p class="sub">Наведите камеру на номер автомобиля. Кадры отправляются автоматически.</p>
+
+<div class="card">
+    <div class="field">
+        <label for="apiKey">Ключ доступа</label>
+        <input id="apiKey" type="password" placeholder="Bearer-ключ сервиса" autocomplete="off">
+        <label class="remember" style="margin-top:8px">
+            <input id="rememberKey" type="checkbox"> запомнить ключ в этом браузере
+        </label>
+    </div>
+
+    <div class="field">
+        <label for="sessionId">Session ID</label>
+        <input id="sessionId" type="text" value="web-test" autocomplete="off">
+    </div>
+
+    <button id="startBtn" type="button">Начать сканирование</button>
+    <button id="stopBtn" type="button" class="stop" disabled>Остановить</button>
+
+    <div class="viewport" id="viewport">
+        <video id="camera" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+        <div class="readout searching" id="readout">
+            <div class="label">ГРНЗ</div>
+            <div class="plate" id="plate">Сканирование…</div>
+            <div class="meta" id="meta"></div>
+            <div class="badge" id="badge">новый номер — запрос в ОСРМ</div>
+        </div>
+    </div>
+
+    <canvas id="grabber" style="display:none"></canvas>
+
+    <div id="status"></div>
+    <div class="stats" id="stats"></div>
+</div>
+
+<!-- Everything below the camera is the OCRM side of the scenario. It appears
+     only once a plate is confirmed, and it has exactly two shapes: the vehicle
+     card, or the statement that the plate is not in the database. The second is
+     NOT a recognition failure and must never look like one. -->
+<div class="card ocrm" id="ocrmCard" hidden>
+    <div class="ocrm-head">
+        <div>
+            <div class="ocrm-label">Поиск в ОСРМ</div>
+            <div class="ocrm-plate" id="ocrmPlate">—</div>
+        </div>
+        <div class="ocrm-state" id="ocrmState">поиск…</div>
+    </div>
+
+    <div id="ocrmFound" hidden>
+        <div class="rows" id="ocrmRows"></div>
+        <button id="visitBtn" type="button" class="visit">Создать выезд</button>
+        <div class="visit-done" id="visitDone" hidden></div>
+    </div>
+
+    <div id="ocrmMissing" hidden>
+        <p class="missing-title">Номер распознан, но автомобиль не найден в базе ОСРМ.</p>
+        <p class="missing-note">Распознавание отработало верно. Это ответ базы, а не ошибка чтения номера.</p>
+    </div>
+
+    <p class="testdata">Демонстрационные данные. Это не база ОСРМ банка: заёмщики,
+    кредиты и автомобили здесь вымышленные.</p>
+</div>
+
+<div class="card note">
+    Страница отправляет кадры на <code>POST /api/v1/recognize</code> того же сервера, по одному за раз:
+    следующий кадр уходит только после ответа на предыдущий, поэтому очередь запросов не растёт.
+    Поиск в базе ОСРМ выполняется, когда в ответе приходит <code>changed: true</code>.
+    Когда номер перестаёт читаться, сервис через 2 секунды его сбрасывает
+    (<code>confirmed: false</code>) — карточку машины в этот момент надо скрывать.
+</div>
+
+<script>
+"use strict";
+
+// One frame at a time. The next frame is sent only after the previous response,
+// and never sooner than MIN_INTERVAL_MS after the previous send, so the server
+// is not flooded and no queue of stale frames builds up.
+const MIN_INTERVAL_MS = 350;
+const MAX_FRAME_WIDTH = 1280;
+const JPEG_QUALITY = 0.8;
+const MAX_CONSECUTIVE_FAILURES = 10;
+
+// Aiming guide. Measured on our four videos: of 218 failed readings, 94 were
+// fragments and 111 had characters lost or doubled, while only 6 were a letter
+// the recogniser confuses. Almost everything we lose is a crop that arrived too
+// small, so the page asks the operator to come closer.
+//
+// The two numbers below now come from bench/crop_size.py over 468 readings on
+// those videos, grouped by how much of the frame width the plate took:
+//
+//     up to 15%   almost nothing reads
+//     15-20%      41%
+//     20-27%      60%
+//     27-35%      75%
+//     35-50%      81%      <- the working zone
+//     above 50%   68%
+//
+// So the guide is sized for a plate filling about 42% of the frame, and the
+// hint asks for more while it is under 27%. Above 50% the drop is not a reason
+// to tell the operator to step back: counting only genuine one-row plates it
+// shrinks to 90% against 84.5%, around one standard error, so there is no
+// evidence for a penalty for being close.
+//
+// Honest limit, worth keeping in mind before this is quoted anywhere: counting
+// only one-row plates, the success rate barely moves with width at all. Part of
+// what the raw curve calls "too small" is really "the detector's box came out
+// too tall", which happens at distance because its margin is then a large share
+// of the crop. Both are fixed by the same thing the page asks for, so the guide
+// stands either way, but width is not proven to be the cause on its own.
+const GUIDE_WIDTH_FRAC = 0.42;
+const GUIDE_ASPECT = 4.6;          // a one-row Kazakh plate is roughly 4.6:1
+const AIM_MIN_FILL = 0.64;         // 0.27 of the frame / 0.42 guide
+
+const AIM_HINTS = {
+    none: "Наведите камеру на номер",
+    small: "Поднесите камеру ближе",
+    ok: "Держите ровно",
+};
+
+const els = {
+    apiKey: document.getElementById("apiKey"),
+    rememberKey: document.getElementById("rememberKey"),
+    sessionId: document.getElementById("sessionId"),
+    startBtn: document.getElementById("startBtn"),
+    stopBtn: document.getElementById("stopBtn"),
+    viewport: document.getElementById("viewport"),
+    camera: document.getElementById("camera"),
+    overlay: document.getElementById("overlay"),
+    grabber: document.getElementById("grabber"),
+    readout: document.getElementById("readout"),
+    plate: document.getElementById("plate"),
+    meta: document.getElementById("meta"),
+    badge: document.getElementById("badge"),
+    status: document.getElementById("status"),
+    stats: document.getElementById("stats"),
+    ocrmCard: document.getElementById("ocrmCard"),
+    ocrmPlate: document.getElementById("ocrmPlate"),
+    ocrmState: document.getElementById("ocrmState"),
+    ocrmFound: document.getElementById("ocrmFound"),
+    ocrmRows: document.getElementById("ocrmRows"),
+    ocrmMissing: document.getElementById("ocrmMissing"),
+    visitBtn: document.getElementById("visitBtn"),
+    visitDone: document.getElementById("visitDone"),
+};
+
+let stream = null;
+let scanning = false;
+let apiKeyInUse = "";      // kept so the OCRM calls can authenticate too
+let ocrmPlate = "";        // the plate the card on screen belongs to
+let failures = 0;
+let badgeTimer = null;
+const sent = { frames: 0, errors: 0, serverMs: [], startedAt: 0 };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function setStatus(text, kind) {
+    els.status.textContent = text;
+    els.status.className = kind || "";
+}
+
+/* The key is only kept if the box is ticked; storage can throw in private mode. */
+function loadKey() {
+    try {
+        const saved = localStorage.getItem("lpr_api_key");
+        if (saved) { els.apiKey.value = saved; els.rememberKey.checked = true; }
+    } catch (e) { /* storage unavailable */ }
+}
+function saveKey() {
+    try {
+        if (els.rememberKey.checked) localStorage.setItem("lpr_api_key", els.apiKey.value.trim());
+        else localStorage.removeItem("lpr_api_key");
+    } catch (e) { /* storage unavailable */ }
+}
+
+
+/* ---- OCRM side of the scenario -------------------------------------------
+   The search runs when the service reports changed: true, which is the moment
+   a new vehicle is confirmed. Holding the same plate does not search again.
+
+   Two outcomes, and keeping them apart is the point of the whole screen: the
+   vehicle card, or a plain statement that this plate is not in the database.
+   The second is not a recognition failure and is never shown as one. */
+
+const OCRM_SECTIONS = [
+    ["Заёмщик", "borrower", [["Имя", "name"], ["Телефон", "phone"]]],
+    ["Кредит", "credit", [["Номер", "number"], ["Сумма", "amount"],
+                          ["Просрочка, дней", "overdue_days"], ["Статус", "status"]]],
+    ["Автомобиль", "vehicle", [["Марка", "make"], ["Модель", "model"],
+                               ["Год", "year"], ["Цвет", "color"], ["VIN", "vin"]]],
+    ["Залог", "collateral", [["Номер", "number"], ["Оценка", "value"], ["Статус", "status"]]],
+    ["Подразделение", "organization", [["Филиал", "branch"], ["Ответственный", "manager"]]],
+];
+
+function hideOcrm() {
+    ocrmPlate = "";
+    els.ocrmCard.hidden = true;
+    els.visitDone.hidden = true;
+    els.visitBtn.disabled = false;
+    els.visitBtn.textContent = "Создать выезд";
+}
+
+function renderVehicle(record) {
+    els.ocrmRows.textContent = "";
+    for (const [title, key, fields] of OCRM_SECTIONS) {
+        const block = record[key];
+        if (!block) continue;
+        const section = document.createElement("section");
+        const h = document.createElement("h4");
+        h.textContent = title;
+        section.appendChild(h);
+        const dl = document.createElement("dl");
+        for (const [label, field] of fields) {
+            if (block[field] === undefined || block[field] === null || block[field] === "") continue;
+            const dt = document.createElement("dt");
+            dt.textContent = label;
+            const dd = document.createElement("dd");
+            dd.textContent = String(block[field]);
+            // Overdue days and an overdue status are the reason a field visit
+            // happens at all, so they are the one thing the card highlights.
+            if ((field === "overdue_days" && Number(block[field]) > 0)
+                || (field === "status" && String(block[field]).startsWith("просроч"))) {
+                dd.className = "warn";
+            }
+            dl.append(dt, dd);
+        }
+        section.appendChild(dl);
+        els.ocrmRows.appendChild(section);
+    }
+}
+
+async function searchOcrm(plate) {
+    ocrmPlate = plate;
+    els.ocrmCard.hidden = false;
+    els.ocrmPlate.textContent = plate;
+    els.ocrmFound.hidden = true;
+    els.ocrmMissing.hidden = true;
+    els.visitDone.hidden = true;
+    els.visitBtn.disabled = false;
+    els.visitBtn.textContent = "Создать выезд";
+    els.ocrmState.className = "ocrm-state";
+    els.ocrmState.textContent = "поиск…";
+
+    let data;
+    try {
+        const response = await fetch("/api/v1/vehicle/" + encodeURIComponent(plate), {
+            headers: { "Authorization": "Bearer " + apiKeyInUse },
+        });
+        data = await response.json();
+        if (!response.ok) throw new Error(data.error || response.status);
+    } catch (e) {
+        els.ocrmState.textContent = "база недоступна";
+        els.ocrmMissing.hidden = false;
+        return;
+    }
+    if (ocrmPlate !== plate) return;          // another car arrived meanwhile
+
+    if (data.found) {
+        els.ocrmState.className = "ocrm-state found";
+        els.ocrmState.textContent = "найден";
+        renderVehicle(data);
+        els.ocrmFound.hidden = false;
+    } else {
+        els.ocrmState.className = "ocrm-state missing";
+        els.ocrmState.textContent = data.database === "not_configured"
+            ? "база не настроена" : "в базе нет";
+        els.ocrmMissing.hidden = false;
+    }
+}
+
+async function createVisit() {
+    if (!ocrmPlate) return;
+    els.visitBtn.disabled = true;
+    els.visitBtn.textContent = "Создаём…";
+    try {
+        const response = await fetch("/api/v1/visit", {
+            method: "POST",
+            headers: {
+                "Authorization": "Bearer " + apiKeyInUse,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ plate: ocrmPlate, note: "создано со страницы сканирования" }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || response.status);
+        els.visitDone.textContent = "Выезд создан: " + data.visit_id;
+        els.visitDone.hidden = false;
+        els.visitBtn.textContent = "Выезд создан";
+    } catch (e) {
+        els.visitDone.textContent = "Не удалось создать выезд: " + e.message;
+        els.visitDone.hidden = false;
+        els.visitBtn.disabled = false;
+        els.visitBtn.textContent = "Создать выезд";
+    }
+}
+
+function showPlate(data, aim) {
+    const plate = data.plate || "";
+    if (plate && data.confirmed) {
+        els.readout.classList.remove("searching");
+        els.plate.textContent = plate;
+        const parts = [];
+        if (data.ocr_confidence != null) parts.push("OCR " + Number(data.ocr_confidence).toFixed(2));
+        if (data.plate_type) parts.push(data.plate_type === "square" ? "квадратный" : "обычный");
+        els.meta.textContent = parts.join("   ");
+    } else {
+        // Cleared or not confirmed yet: OCRM would hide the vehicle card here.
+        els.readout.classList.add("searching");
+        // The aiming hint replaces the idle text: it tells the operator what
+        // to change instead of only saying that nothing was found yet.
+        els.plate.textContent = AIM_HINTS[aim] || "Сканирование…";
+        els.meta.textContent = data.raw_text ? "читается: " + data.raw_text : "";
+    }
+
+    if (data.changed) {
+        els.badge.classList.add("on");
+        clearTimeout(badgeTimer);
+        badgeTimer = setTimeout(() => els.badge.classList.remove("on"), 2500);
+    }
+}
+
+/* Draws the aiming guide and the detector's box, and returns how the aim looks:
+   "none" when nothing is detected, "small" when the plate is smaller than the
+   guide asks for, "ok" otherwise.
+
+   bbox comes in the coordinates of the frame we sent, so it is scaled by the
+   ratio between the displayed picture and that frame.
+
+   The guide is a hint and nothing more. The whole frame is still sent, so a
+   plate outside the brackets is recognised exactly as before. Cropping to the
+   guide on the phone would cut the traffic and the server's work, but it can
+   also cut a plate in half, so it stays out until it is measured. */
+function drawOverlay(bbox, frameW) {
+    const c = els.overlay;
+    const w = els.camera.clientWidth, h = els.camera.clientHeight;
+    if (!w || !h) return "none";
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+
+    const gw = w * GUIDE_WIDTH_FRAC;
+    const gh = gw / GUIDE_ASPECT;
+    const gx = (w - gw) / 2, gy = (h - gh) / 2;
+
+    let aim = "none", box = null;
+    if (bbox && bbox.length >= 4 && frameW) {
+        const k = w / frameW;
+        box = [bbox[0] * k, bbox[1] * k, bbox[2] * k, bbox[3] * k];
+        aim = (box[2] - box[0]) >= gw * AIM_MIN_FILL ? "ok" : "small";
+    }
+
+    const colour = aim === "ok" ? "#22c55e"
+                 : aim === "small" ? "#f59e0b"
+                 : "rgba(255,255,255,.75)";
+    const line = Math.max(2, Math.round(w / 220));
+
+    // Corner brackets rather than a closed rectangle, so no line sits across
+    // the plate the operator is trying to read.
+    const arm = Math.min(gw * 0.16, gh * 0.6);
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = line;
+    for (const [x, y, sx, sy] of [[gx, gy, 1, 1], [gx + gw, gy, -1, 1],
+                                  [gx, gy + gh, 1, -1], [gx + gw, gy + gh, -1, -1]]) {
+        ctx.beginPath();
+        ctx.moveTo(x + arm * sx, y);
+        ctx.lineTo(x, y);
+        ctx.lineTo(x, y + arm * sy);
+        ctx.stroke();
+    }
+
+    if (box) {
+        ctx.strokeStyle = colour;
+        ctx.lineWidth = line;
+        ctx.strokeRect(box[0], box[1], box[2] - box[0], box[3] - box[1]);
+    }
+    return aim;
+}
+
+function grabFrame() {
+    const video = els.camera;
+    if (!video.videoWidth || !video.videoHeight) return null;
+
+    const scale = Math.min(1, MAX_FRAME_WIDTH / video.videoWidth);
+    const canvas = els.grabber;
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas;
+}
+
+function toBlob(canvas) {
+    return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", JPEG_QUALITY));
+}
+
+function updateStats() {
+    const secs = (performance.now() - sent.startedAt) / 1000;
+    const fps = secs > 0 ? sent.frames / secs : 0;
+    const times = sent.serverMs;
+    const avg = times.length ? times.reduce((a, b) => a + b, 0) / times.length : 0;
+    els.stats.textContent =
+        `кадров ${sent.frames}   ${fps.toFixed(1)}/с   сервер ${avg.toFixed(0)} мс` +
+        (sent.errors ? `   ошибок ${sent.errors}` : "");
+}
+
+/* Returns "ok" | "wait" (nothing to send yet) | "retry" (failed) | "stop" */
+async function sendOneFrame(apiKey, sessionId) {
+    const canvas = grabFrame();
+    if (!canvas) return "wait";                 // camera not warmed up yet
+
+    const blob = await toBlob(canvas);
+    if (!blob) return "wait";
+
+    let response;
+    try {
+        response = await fetch("/api/v1/recognize?session_id=" + encodeURIComponent(sessionId), {
+            method: "POST",
+            headers: { "Content-Type": "image/jpeg", "Authorization": "Bearer " + apiKey },
+            body: blob,
+        });
+    } catch (e) {
+        setStatus("Нет связи с сервером, повтор…", "warn");
+        return "retry";
+    }
+
+    let data = {};
+    try { data = await response.json(); } catch (e) { /* non-JSON error page */ }
+
+    if (response.status === 401 || response.status === 403) {
+        setStatus("Неверный ключ доступа", "err");
+        return "stop";
+    }
+    if (response.status === 400 && data.error_code === "bad_request") {
+        setStatus("Сервер отклонил запрос: " + (data.error || "bad_request"), "err");
+        return "stop";
+    }
+    if (!response.ok) {
+        // 503 while a worker restarts, 413, a bad frame: skip it and keep going.
+        setStatus("Сервер: " + (data.error_code || ("HTTP " + response.status)) + ", продолжаем", "warn");
+        return "retry";
+    }
+
+    sent.frames += 1;
+    if (data.processing_time_ms != null) {
+        sent.serverMs.push(data.processing_time_ms);
+        if (sent.serverMs.length > 50) sent.serverMs.shift();
+    }
+    const aim = drawOverlay(data.bbox, canvas.width);
+    showPlate(data, aim);
+
+    // changed: true is the moment a new vehicle is confirmed, and the only
+    // moment OCRM is searched. confirmed: false means the service let the
+    // plate go, so the card must come off the screen with it.
+    if (data.changed && data.plate) {
+        searchOcrm(data.plate);
+    } else if (!data.confirmed && ocrmPlate) {
+        hideOcrm();
+    }
+    updateStats();
+    setStatus("Сканирование идёт");
+    return "ok";
+}
+
+async function scanLoop(apiKey, sessionId) {
+    while (scanning) {
+        const started = performance.now();
+        let outcome;
+        try {
+            outcome = await sendOneFrame(apiKey, sessionId);
+        } catch (e) {
+            outcome = "retry";
+        }
+
+        if (outcome === "stop") { stopScanning(); return; }
+        if (outcome === "retry") {
+            sent.errors += 1;
+            failures += 1;
+            updateStats();
+            if (failures >= MAX_CONSECUTIVE_FAILURES) {
+                setStatus("Сервер не отвечает, сканирование остановлено", "err");
+                stopScanning();
+                return;
+            }
+        } else if (outcome === "ok") {
+            failures = 0;
+        }
+
+        const left = MIN_INTERVAL_MS - (performance.now() - started);
+        if (left > 0) await sleep(left);
+    }
+}
+
+async function startScanning() {
+    const apiKey = els.apiKey.value.trim();
+    const sessionId = els.sessionId.value.trim();
+
+    if (!sessionId) { setStatus("Укажите session ID", "err"); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setStatus("Браузер не даёт доступ к камере. Нужен HTTPS.", "err");
+        return;
+    }
+
+    els.startBtn.disabled = true;
+    setStatus("Запрашиваем камеру…");
+
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+        });
+    } catch (e) {
+        setStatus("Камера недоступна: " + e.message, "err");
+        els.startBtn.disabled = false;
+        return;
+    }
+
+    saveKey();
+    apiKeyInUse = apiKey;
+    hideOcrm();
+    els.camera.srcObject = stream;
+    els.viewport.classList.add("on");
+    els.stopBtn.disabled = false;
+
+    scanning = true;
+    failures = 0;
+    sent.frames = 0; sent.errors = 0; sent.serverMs = []; sent.startedAt = performance.now();
+    showPlate({}, drawOverlay(null, 0));
+    setStatus("Сканирование идёт");
+    scanLoop(apiKey, sessionId);
+}
+
+function stopScanning() {
+    scanning = false;
+    if (stream) {
+        for (const track of stream.getTracks()) track.stop();
+        stream = null;
+    }
+    els.camera.srcObject = null;
+    els.viewport.classList.remove("on");
+    els.startBtn.disabled = false;
+    els.stopBtn.disabled = true;
+    if (!els.status.classList.contains("err")) setStatus("Сканирование остановлено");
+}
+
+els.visitBtn.addEventListener("click", createVisit);
+els.startBtn.addEventListener("click", startScanning);
+els.stopBtn.addEventListener("click", stopScanning);
+window.addEventListener("beforeunload", stopScanning);
+
+// A backgrounded tab throttles timers and the camera; stop rather than pile up.
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden && scanning) {
+        stopScanning();
+        setStatus("Сканирование остановлено: страница ушла в фон");
+    }
+});
+
+loadKey();
+</script>
+
+</body>
+</html>

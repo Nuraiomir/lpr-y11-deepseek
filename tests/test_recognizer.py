@@ -1,0 +1,450 @@
+"""
+Regression test for app/lpr/recognizer.py. No GPU and no models needed.
+
+Feeds LPRRecognizer the OCR readings that the GPU pipeline produced on
+videos/20260908_150904.mp4 and checks that it makes the same decisions as
+that run: in particular that the short-lived square plate 979CBB02 is
+confirmed at 2.4 s and the switch to 221ZVZ05 happens at 3.7 s.
+
+The readings are recorded pipeline output, not verified ground truth. This
+test proves the voting and switching logic, not OCR accuracy.
+
+The recordings come from the laboratory repository, where the videos and the
+offline pipeline live. They are kept here as literals on purpose: a test that
+needed those videos could not run in CI.
+
+Run:
+    make test
+"""
+
+import random
+import re
+
+from app.lpr.recognizer import (
+    LPRRecognizer,
+    clean_text,
+    extract_plate,
+    valid_kz_plate,
+)
+
+
+class FakeWorkers:
+    """Replays a fixed, pre-recorded sequence of OCR payloads instead of
+    calling real GPU workers. Detection is not exercised here (bbox/aspect
+    classification is assumed already decided -- see the note below); only
+    the OCR-and-onward path is under test, called directly.
+    """
+    pass
+
+
+def test_video2_catches_short_lived_square_plate_979CBB02():
+    rec = LPRRecognizer()
+
+    # Real square_readings captured from the validated v19 run on
+    # 20260908_150904.mp4 (see this project's earlier results JSON), t=0.1..3.1.
+    square_frames = [
+        (0.1, "KZ979", 0.862, "UZCBB", 0.829),
+        (0.4, "Kz 979", 0.876, "UZCBB", 0.906),
+        (0.7, "Kz 979", 0.866, "02CBB", 0.988),
+        (1.0, "Kz 919", 0.802, "UZCBB", 0.86),
+        (1.3, "Kz 979", 0.747, "UZCBB", 0.896),
+        (1.6, "Kz 979", 0.871, "UZCBB", 0.875),
+        (2.0, "Kz 9/9", 0.698, "UZCBB", 0.879),
+        (2.4, "kz 979", 0.828, "02CBB", 0.98),
+        (3.1, "5", 0.773, "9U", 0.19),
+    ]
+    for t, top_raw, top_conf, bottom_raw, bottom_conf in square_frames:
+        payload = {
+            "top_text": top_raw, "top_conf": top_conf,
+            "bottom_text": bottom_raw, "bottom_conf": bottom_conf,
+        }
+        rec._handle_square_result(payload, t)
+
+    assert rec.confirmed_plate == "979CBB02", (
+        f"expected 979CBB02 to be confirmed by t=3.1, got {rec.confirmed_plate!r} "
+        f"-- this is exactly the v19 fix this module must preserve"
+    )
+    assert rec.switch_events[0]["to"] == "979CBB02"
+    assert rec.switch_events[0]["source"] == "square"
+    assert rec.switch_events[0]["time"] == 2.4, (
+        f"real v19 run confirmed at t=2.4s, got t={rec.switch_events[0]['time']}"
+    )
+    print("[OK] 979CBB02 confirmed at t=2.4s via 'square' source, matching the real v19 run")
+
+    # Real normal_readings immediately following, from the same run --
+    # the vehicle then switches to 221ZVZ05.
+    for t, plate, conf in [(3.5, "221ZVZ05", 0.867), (3.7, "221ZVZ05", 0.777)]:
+        payload = {"text": plate, "conf": conf}
+        rec._handle_normal_result(payload, t)
+
+    assert rec.confirmed_plate == "221ZVZ05"
+    assert rec.switch_events[-1]["to"] == "221ZVZ05"
+    assert rec.switch_events[-1]["source"] == "normal"
+    assert rec.switch_events[-1]["time"] == 3.7, (
+        f"real v19 run switched at t=3.7s, got t={rec.switch_events[-1]['time']}"
+    )
+    print("[OK] switch 979CBB02 -> 221ZVZ05 at t=3.7s, matching the real v19 run")
+
+
+def test_single_strong_read_confirms_immediately():
+    """SWITCH_STRONG_CONF path: one read at >=0.95 confirms without waiting
+    for a second read -- this is the mechanism ABSENT from the current
+    lpr_camera_server.py prototype (documented in LPR_API_CONTRACT_REVIEW.md)."""
+    rec = LPRRecognizer()
+    changed = rec.consider_plate("545BDR05", 0.99, 0.1, "normal")
+    assert changed is True
+    assert rec.confirmed_plate == "545BDR05"
+    print("[OK] a single conf=0.99 read confirms immediately (SWITCH_STRONG_CONF path)")
+
+
+def test_out_of_order_result_does_not_roll_back_confirmed_plate():
+    """last_decision_t protection -- absent from lpr_camera_server.py."""
+    rec = LPRRecognizer()
+    rec.consider_plate("545BDR05", 0.99, 5.0, "normal")
+    stale_changed = rec.consider_plate("633BBT02", 0.99, 2.0, "square")  # t=2.0 < last_decision_t=5.0
+    assert stale_changed is False
+    assert rec.confirmed_plate == "545BDR05"
+    assert rec.out_of_order_decisions == 1
+    print("[OK] a result timestamped before the last decision cannot roll back confirmed_plate")
+
+
+def test_invalid_format_never_confirms():
+    rec = LPRRecognizer()
+    assert rec.consider_plate("NOTAPLATE", 0.99, 1.0, "normal") is False
+    assert rec.confirmed_plate == ""
+
+
+
+# ---------------------------------------------------------------------------
+# Stale plate timeout (HTTP path, process_frame)
+# ---------------------------------------------------------------------------
+
+import numpy as np  # noqa: E402
+
+FRAME = np.zeros((120, 420, 3), np.uint8)
+NORMAL_BOX = (0, 0, 400, 100, 0.9)          # aspect 4.0 -> single-row plate
+
+
+class ScriptedWorkers:
+    """detect() and ocr() answer from a script: None = no plate in view,
+    otherwise (plate_text, ocr_conf)."""
+
+    def __init__(self):
+        self.next = None
+
+    def detect(self, frame):
+        return None if self.next is None else NORMAL_BOX
+
+    def ocr(self, crop, mode):
+        text, conf = self.next
+        return {"text": text, "conf": conf}
+
+
+def run(rec, workers, t, reading):
+    workers.next = reading
+    return rec.process_frame(FRAME, workers, t)
+
+
+def test_stale_plate_is_cleared_after_hold():
+    rec, w = LPRRecognizer(plate_hold_sec=2.0), ScriptedWorkers()
+    r = run(rec, w, 0.0, ("545BDR05", 0.99))
+    assert r["plate"] == "545BDR05" and r["changed"] is True
+    assert run(rec, w, 1.9, None)["plate"] == "545BDR05", "cleared too early"
+    r = run(rec, w, 2.1, None)
+    assert r["plate"] == "" and r["confirmed"] is False, r
+    assert r["changed"] is False, "a clear must not ask OCRM to search"
+    assert rec.plate_clears == 1
+    print("[OK] plate not read for more than 2 s is cleared; clearing does not set changed")
+
+
+def test_plate_is_kept_while_it_keeps_being_read():
+    rec, w = LPRRecognizer(plate_hold_sec=2.0), ScriptedWorkers()
+    t = 0.0
+    run(rec, w, t, ("545BDR05", 0.99))
+    for _ in range(30):                       # 0.7 s gaps: the longest seen on real video
+        t += 0.35
+        run(rec, w, t, None)
+        t += 0.35
+        r = run(rec, w, t, ("545BDR05", 0.93))
+        assert r["plate"] == "545BDR05", f"cleared at t={t:.2f} while still being read"
+    assert rec.plate_clears == 0
+    print("[OK] plate read every 0.7 s for 21 s is never cleared")
+
+
+def test_reads_of_another_plate_do_not_keep_the_old_one():
+    rec, w = LPRRecognizer(plate_hold_sec=2.0), ScriptedWorkers()
+    run(rec, w, 0.0, ("545BDR05", 0.99))
+    # Camera moves to the next car: its plate is seen, but read too weakly
+    # and too rarely to confirm (reads further apart than SWITCH_WINDOW_SEC).
+    # The old plate must not stay on screen meanwhile.
+    run(rec, w, 0.9, ("633BBT02", 0.80))
+    r = run(rec, w, 2.6, ("633BBT02", 0.80))
+    assert r["plate"] == "", f"old plate kept alive by another car: {r['plate']!r}"
+    print("[OK] reads of a different plate do not keep the previous plate on screen")
+
+
+def test_cleared_plate_is_confirmed_again_as_a_change():
+    rec, w = LPRRecognizer(plate_hold_sec=2.0), ScriptedWorkers()
+    run(rec, w, 0.0, ("545BDR05", 0.99))
+    run(rec, w, 3.0, None)                    # cleared
+    r = run(rec, w, 4.0, ("545BDR05", 0.99))
+    assert r["plate"] == "545BDR05" and r["changed"] is True, r
+    print("[OK] the same car coming back is confirmed again with changed=true")
+
+
+def test_zero_hold_disables_the_timeout():
+    rec, w = LPRRecognizer(plate_hold_sec=0), ScriptedWorkers()
+    run(rec, w, 0.0, ("545BDR05", 0.99))
+    assert run(rec, w, 60.0, None)["plate"] == "545BDR05"
+    print("[OK] plate_hold_sec=0 keeps the old behaviour")
+
+
+def test_votes_for_a_gone_square_plate_do_not_keep_it_on_screen():
+    """Square plates are decided from votes over the last 3 s. While the camera
+    already reads the next car, those votes can still name the old plate; that
+    must not keep the old plate on screen. Readings below are from the real run
+    on videos/20260909_171120.mp4: at 10.4 s and 10.8 s the square path is
+    reading the next car (694BPT05), not 633BBT02."""
+    rec = LPRRecognizer(plate_hold_sec=2.0)
+    square = [(7.5, "633", 0.995, "02BBT", 0.899), (7.8, "Kz 633", 0.855, "02BBT", 0.97),
+              (8.1, "633", 0.993, "02BBT", 0.919), (9.0, "", 0.0, "JO", 0.289),
+              (10.4, "0/BPT05", 0.856, "KZ67", 0.828), (10.8, "/BPT05", 0.826, "KZ671", 0.817)]
+    shown = {}
+    for t, top, tc, bottom, bc in square:
+        rec._handle_square_result({"top_text": top, "top_conf": tc,
+                                   "bottom_text": bottom, "bottom_conf": bc}, t)
+        rec.drop_stale_plate(t)
+        shown[t] = rec.confirmed_plate
+    assert shown[8.1] == "633BBT02", shown
+    assert shown[9.0] == "633BBT02", "cleared before 2 s had passed"
+    assert shown[10.4] == "", f"old square plate kept alive by the next car: {shown[10.4]!r}"
+    print("[OK] votes for a square plate that has left do not keep it on screen")
+
+
+def test_square_plate_read_by_one_row_stays():
+    """One readable row keeps a square plate on screen while the other row's
+    votes still support it. After that no full plate can be formed, and the
+    plate is cleared PLATE_HOLD_SEC later."""
+    rec = LPRRecognizer(plate_hold_sec=2.0)
+    for t in (5.0, 5.3, 5.6):                 # both rows read; last top read at 5.6
+        rec._handle_square_result({"top_text": "633", "top_conf": 0.97,
+                                   "bottom_text": "02BBT", "bottom_conf": 0.96}, t)
+    assert rec.confirmed_plate == "633BBT02"
+
+    t = 5.6
+    shown = {}
+    while t < 11.5:                           # from now on only the bottom row reads
+        t = round(t + 0.6, 1)
+        rec._handle_square_result({"top_text": "6?3", "top_conf": 0.5,
+                                   "bottom_text": "02BBT", "bottom_conf": 0.95}, t)
+        rec.drop_stale_plate(t)
+        shown[t] = rec.confirmed_plate
+    # The last full reading is at 5.6. Its top-row vote can hold the plate for
+    # another WINDOW_SEC, and PLATE_HOLD_SEC on top of that.
+    assert all(p == "633BBT02" for tt, p in shown.items() if tt <= 9.8), shown
+    assert all(p == "" for tt, p in shown.items() if tt >= 10.4), shown
+    print("[OK] square plate with one readable row stays a few seconds, then is cleared")
+
+
+def test_cleared_square_plate_is_not_revived_by_its_old_votes():
+    """Real GPU run, videos/20260909_171120.mp4 at 10 fps: 633BBT02 was cleared
+    at 10.2 s, then confirmed again at 10.4 s from its own 3-second-old votes
+    while the camera was already on the next car. That must not happen."""
+    rec = LPRRecognizer(plate_hold_sec=2.0)
+    reads = {5.6: ("633", 0.972, "02BBT", 0.902), 5.9: ("633", 0.945, "02BBT", 0.981),
+             6.2: ("633", 0.936, "02BBT", 0.974), 6.6: ("633", 0.883, "02BBT", 0.962),
+             6.9: ("633", 0.968, "02BBT", 0.962), 7.2: ("633", 0.98, "02BBT", 0.92),
+             7.5: ("633", 0.995, "02BBT", 0.899), 7.8: ("Kz 633", 0.855, "02BBT", 0.97),
+             8.1: ("633", 0.993, "02BBT", 0.919), 9.0: ("", 0.0, "JO", 0.289),
+             10.4: ("0/BPT05", 0.856, "KZ67", 0.828), 10.8: ("/BPT05", 0.826, "KZ671", 0.817)}
+    shown = {}
+    for step in range(56, 120):               # 5.6 s .. 11.9 s at 10 fps
+        t = round(step * 0.1, 1)
+        if t in reads:
+            top, tc, bottom, bc = reads[t]
+            rec._handle_square_result({"top_text": top, "top_conf": tc,
+                                       "bottom_text": bottom, "bottom_conf": bc}, t)
+        rec.drop_stale_plate(t)
+        shown[t] = rec.confirmed_plate
+    assert shown[10.2] == "", shown[10.2]
+    revived = [t for t in shown if t > 10.2 and shown[t]]
+    assert not revived, f"633BBT02 came back at {revived[0]} s with no fresh reading"
+    print("[OK] a cleared square plate is not confirmed again from its old votes")
+
+
+class SquareWorkers:
+    """Square-shaped detection; OCR answers from a (top, top_conf, bottom, bottom_conf) reading."""
+
+    def __init__(self):
+        self.reading = None
+
+    def detect(self, frame):
+        return (0, 0, 200, 160, 0.9)          # aspect 1.25 -> square plate
+
+    def ocr(self, crop, mode):
+        top, tc, bottom, bc = self.reading
+        if mode == "square":
+            return {"top_text": top, "top_conf": tc, "bottom_text": bottom, "bottom_conf": bc}
+        return {"text": "", "conf": 0.0}
+
+
+def test_square_ocr_confidence_is_the_weaker_row_of_this_frame():
+    """Real readings from videos/20260909_171120.mp4. At 9.0 s OCR read nothing
+    ('' / 'JO'); the old code reported the vote-based 0.99 there."""
+    rec, w = LPRRecognizer(), SquareWorkers()
+    frame = np.zeros((200, 220, 3), np.uint8)
+
+    def square_frame(t, reading):
+        w.reading = reading
+        for _ in range(3):                    # square OCR runs on every 3rd detection
+            r = rec.process_frame(frame, w, t)
+            if r["ocr_confidence"] is not None:
+                return r
+        raise AssertionError("square OCR did not run")
+
+    for t in (7.5, 7.8, 8.1):
+        r = square_frame(t, ("633", 0.995, "02BBT", 0.899))
+    assert r["plate"] == "633BBT02"
+    assert abs(r["ocr_confidence"] - 0.899) < 1e-9, r["ocr_confidence"]
+    assert r["raw_text"] == "633 / 02BBT", r["raw_text"]
+
+    r = square_frame(9.0, ("", 0.0, "JO", 0.289))
+    assert r["plate"] == "633BBT02", "the plate itself is still confirmed from votes"
+    assert r["ocr_confidence"] == 0.0, f"reported {r['ocr_confidence']} for an empty read"
+    assert r["raw_text"] == " / JO", r["raw_text"]
+    print("[OK] square ocr_confidence is this frame's weaker row; raw_text shows both rows")
+
+
+def test_wrong_square_plates_from_the_hard_conditions_run():
+    """Four wrong plates confirmed during the hard-conditions benchmark, built
+    from the readings the server actually logged. Each one came from a
+    different mechanism, and none of them may be confirmed."""
+    cases = {
+        # 'K2049' is "049" with the KZ marker read as a 2: more than three
+        # digits, so the read is ambiguous and must not vote.
+        "004BXS02": [(1.10, "02.47", 0.90, "02BXS", 0.95), (1.40, "049", 0.90, "02BXS", 0.95),
+                     (1.70, "K2049", 0.90, "02BXS", 0.95)],
+        # A single reading of "099" (dark, 4 read as 9) used to be enough,
+        # because the digit-by-digit vote counted it once per position.
+        "099BXS02": [(0.70, "BXS", 0.50, "02BXS", 0.95), (1.00, "2Rvo", 0.60, "02BXS", 0.95),
+                     (1.30, "R09", 0.70, "02BXS", 0.95), (1.60, "099", 0.95, "02BXS", 0.95)],
+        "204BXS02": [(1.30, "040", 0.90, "02BXS", 0.95), (1.60, "2049", 0.90, "02BXS", 0.95)],
+        # "P05" is the tail of the previous car's plate 545BDR05; the bottom
+        # row belongs to the next car. The two were never read together.
+        "905BBT02": [(3.70, "P05", 0.90, "BDRO", 0.60), (5.10, "APAJER", 0.50, "02BBT", 0.93),
+                     (5.40, "TAPAJERO", 0.50, "02BBT", 0.93)],
+    }
+    for wrong, reads in cases.items():
+        rec = LPRRecognizer(plate_hold_sec=0)
+        for t, top, tc, bottom, bc in reads:
+            rec._handle_square_result({"top_text": top, "top_conf": tc,
+                                       "bottom_text": bottom, "bottom_conf": bc}, t)
+            assert rec.confirmed_plate == "", (
+                f"confirmed {rec.confirmed_plate} at {t} s from readings that never "
+                f"showed a plate (field run confirmed {wrong} here)")
+    print("[OK] the four wrong square plates seen in the field are no longer confirmed")
+
+
+def test_square_plate_needs_its_rows_read_in_one_frame():
+    rec = LPRRecognizer(plate_hold_sec=0)
+    # Two strong readings of each row, but never both rows in the same frame.
+    for t, top, bottom in [(0.0, "633", ""), (0.3, "", "02BBT"), (0.6, "633", ""), (0.9, "", "02BBT")]:
+        rec._handle_square_result({"top_text": top, "top_conf": 0.97 if top else 0.0,
+                                   "bottom_text": bottom, "bottom_conf": 0.97 if bottom else 0.0}, t)
+    assert rec.confirmed_plate == "", rec.confirmed_plate
+    rec._handle_square_result({"top_text": "633", "top_conf": 0.97,
+                               "bottom_text": "02BBT", "bottom_conf": 0.97}, 1.2)
+    assert rec.confirmed_plate == "633BBT02", "one frame with both rows should confirm"
+    print("[OK] a square plate is confirmed only after its rows are read together")
+
+
+def test_junk_detections_are_not_sent_to_ocr():
+    """Box sizes from the real parking video. The small ones are badges and
+    lettering the detector fired on; the large ones did produce plates."""
+    from app.lpr.recognizer import looks_like_plate
+    frame = (2160, 3840)                    # the parking video, held upright
+
+    junk = [(105, 114), (78, 218), (121, 132), (57, 70), (85, 167), (69, 191)]
+    for w, h in junk:
+        assert not looks_like_plate(w, h, *frame), f"{w}x{h} should be skipped"
+
+    plates = [(1751, 833), (2067, 755), (1907, 603), (358, 379), (1516, 909)]
+    for w, h in plates:
+        assert looks_like_plate(w, h, *frame), f"{w}x{h} produced a plate, must pass"
+
+    # The same crops on a phone-sized frame, and in landscape: the rule holds.
+    assert looks_like_plate(1751 // 3, 833 // 3, 2160 // 3, 3840 // 3)
+    assert not looks_like_plate(105 // 3, 114 // 3, 2160 // 3, 3840 // 3)
+    assert looks_like_plate(1300, 340, 3840, 2160), "landscape video, real plate"
+    assert not looks_like_plate(105, 114, 3840, 2160)
+    print("[OK] badge-sized detections are skipped, plate-sized ones pass at any frame size")
+
+
+
+def test_plate_is_pulled_out_of_a_reading_that_includes_the_kz_block():
+    """Readings from the labelled AUTO.RIA KZ crops. The plate is printed next
+    to a "KZ" block, so OCR returns it as part of the text."""
+    cases = {
+        "KZ001AP06": "",                        # old layout, 2 letters: still rejected
+        "KZ545BDR05": "545BDR05",
+        "Z001BUZ10": "001BUZ10",
+        "K2049BXS02": "",                       # a digit outside the plate: see below
+        "545BDR05": "545BDR05",                 # already clean: unchanged
+        "MITSUBISHI": "",
+        "830BX": "",                            # a cut-off reading stays rejected
+        "": "",
+    }
+    for text, expected in cases.items():
+        assert extract_plate(clean_text(text)) == expected, (text, extract_plate(clean_text(text)))
+
+    # Two plates in one reading: refuse rather than guess which car it is.
+    assert extract_plate("999XYZ07545BDR05") == ""
+    print("[OK] the plate is pulled out of a KZ-prefixed reading; two plates are refused")
+
+
+def test_a_stray_digit_around_the_plate_is_refused():
+    """The regression this check exists for.
+
+    On videos/20260908_150800.mp4 the plate 822AKH02 came back as "822AKH102".
+    The window "822AKH10" is a perfectly shaped plate of a different car, it
+    collected votes, and the run confirmed it: a vehicle that was never there.
+    An extra digit means OCR returned more digits than a plate has, so the
+    window it lands on is shifted and cannot be trusted. Letters outside the
+    plate are the printed KZ block and stay allowed.
+    """
+    refused = {
+        "822AKH102": "822AKH10",     # the confirmed wrong plate
+        "2241ZVZ05": "241ZVZ05",     # same shape, caught before it confirmed
+        "776AFC119": "776AFC11",
+    }
+    for text, would_have_been in refused.items():
+        assert extract_plate(text) == "", (text, extract_plate(text))
+        assert re.fullmatch(r"\d{3}[A-Z]{3}\d{2}", would_have_been), would_have_been
+
+    # Letters around the plate are the KZ block and must still work.
+    for text, expected in {"KZ545BDR05": "545BDR05", "545BDR05KZ": "545BDR05",
+                           "Z001BUZ10": "001BUZ10"}.items():
+        assert extract_plate(text) == expected, (text, extract_plate(text))
+    print("[OK] a stray digit around the plate is refused, the KZ block is not")
+
+
+def test_extraction_never_changes_a_reading_that_was_already_accepted():
+    """The safety property: every string the old rule accepted keeps its value,
+    so no plate confirmed before can be confirmed differently now."""
+    rng = random.Random(7)
+    digits, letters = "0123456789", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for _ in range(3000):
+        plate = ("".join(rng.choice(digits) for _ in range(3))
+                 + "".join(rng.choice(letters) for _ in range(3))
+                 + "".join(rng.choice(digits) for _ in range(2)))
+        assert valid_kz_plate(plate)
+        assert extract_plate(plate) == plate, plate
+    print("[OK] a reading that was valid before keeps exactly the same plate")
+
+
+def test_kz_prefixed_reading_now_confirms_the_plate():
+    rec = LPRRecognizer(plate_hold_sec=0)
+    for _ in range(2):
+        rec._handle_normal_result({"text": "KZ545BDR05", "conf": 0.93}, 0.0)
+    assert rec.confirmed_plate == "545BDR05", rec.confirmed_plate
+    print("[OK] a plate read together with the KZ block is confirmed, not dropped")
